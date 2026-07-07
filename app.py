@@ -228,9 +228,9 @@ with tab1:
         with col_left:
             cover_data = get_cover_image(info["id"])
             if cover_data:
-                st.image(cover_data, use_column_width=True)
+                st.image(cover_data, width="auto")
             else:
-                st.image("https://via.placeholder.com/160x220?text=No+Cover", use_column_width=True)
+                st.image("https://via.placeholder.com/160x220?text=No+Cover", width="auto")
 
         with col_right:
             st.subheader(f"[{info['id']}] {info['title']}")
