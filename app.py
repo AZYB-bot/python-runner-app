@@ -1,17 +1,12 @@
 import streamlit as st
-import json
 import os
-import queue
 import re
 import shutil
 import sys
 import tempfile
-import threading
-import time
 import random
-from datetime import datetime
+import zipfile
 from io import StringIO
-from collections import deque
 
 try:
     import jmcomic
@@ -19,7 +14,7 @@ try:
     JMCOMIC_AVAILABLE = True
 except ImportError:
     JMCOMIC_AVAILABLE = False
-    st.error("⚠️ jmcomic 库未安装，请运行 `pip install jmcomic`")
+    st.error("⚠️ jmcomic 库未安装")
 
 st.set_page_config(page_title="JM Downloader", layout="wide")
 
@@ -35,57 +30,37 @@ OPTION_BASE = {
     "client": {"impl": "api", "retry_times": 3, "timeout": 15},
 }
 
-_progress_queues: dict = {}
-_download_tasks: dict = {}
-_task_counter = 0
-_task_lock = threading.Lock()
-
 class ProgressCapture(StringIO):
-    def __init__(self, q):
+    def __init__(self):
         super().__init__()
-        self.q = q
-        self._chapter_done = 0
-        self._chapter_total = 0
-        self._image_done = 0
-        self._image_total = 0
+        self.logs = []
+        self.chapter_done = 0
+        self.chapter_total = 0
+        self.image_done = 0
+        self.image_total = 0
 
     def write(self, s):
         super().write(s)
         line = s.strip()
         if not line:
             return
-        msg = {"type": "log", "text": line}
+        self.logs.append(line)
 
         m = re.search(r"章节数:\s*(\d+)", line)
         if m:
-            self._chapter_total = int(m.group(1))
+            self.chapter_total = int(m.group(1))
 
         m = re.search(r"共\s*(\d+)\s*章节", line)
         if m:
-            self._chapter_total = int(m.group(1))
+            self.chapter_total = int(m.group(1))
 
         m = re.search(r"\[(\d+)/(\d+)\]", line)
         if m:
-            self._image_done = int(m.group(1))
-            self._image_total = int(m.group(2))
+            self.image_done = int(m.group(1))
+            self.image_total = int(m.group(2))
 
         if "章节下载完成" in line:
-            self._chapter_done += 1
-
-        if "合并PDF成功" in line:
-            msg["pdf_ok"] = True
-
-        if "本子下载完成" in line:
-            m = re.search(r"\[(\d+)\]", line)
-            if m:
-                msg["album_done_id"] = m.group(1)
-
-        msg["chapter_done"] = self._chapter_done
-        msg["chapter_total"] = max(self._chapter_total, 1)
-        msg["image_done"] = self._image_done
-        msg["image_total"] = max(self._image_total, 1)
-
-        self.q.put(msg)
+            self.chapter_done += 1
 
 def _build_option(temp_dir: str) -> JmOption:
     cfg = dict(OPTION_BASE)
@@ -102,36 +77,6 @@ def _build_option(temp_dir: str) -> JmOption:
         ]
     }
     return JmOption.construct(cfg)
-
-def _run_download(task_id: str, album_id: str, q: queue.Queue, temp_dir: str):
-    try:
-        old = sys.stdout
-        cap = ProgressCapture(q)
-        sys.stdout = cap
-        option = _build_option(temp_dir)
-        option.download_album(album_id)
-
-        pdf_files = sorted(
-            [f for f in os.listdir(temp_dir) if f.endswith(".pdf")],
-            key=lambda x: int(re.sub(r"\D", "", x) or 0),
-        )
-        if not pdf_files:
-            raise RuntimeError("未生成 PDF 文件")
-
-        if len(pdf_files) == 1:
-            final_pdf = os.path.join(temp_dir, f"{album_id}.pdf")
-            os.rename(os.path.join(temp_dir, pdf_files[0]), final_pdf)
-            q.put({"type": "done", "album_id": album_id, "file": final_pdf})
-        else:
-            q.put({"type": "done", "album_id": album_id, "files": pdf_files})
-        if task_id in _download_tasks:
-            _download_tasks[task_id]["status"] = "已完成"
-    except Exception as e:
-        q.put({"type": "error", "message": str(e)})
-        if task_id in _download_tasks:
-            _download_tasks[task_id]["status"] = "失败"
-    finally:
-        sys.stdout = old
 
 def get_album_info(album_id: str):
     try:
@@ -220,95 +165,45 @@ def get_cover_image(album_id: str):
     except Exception:
         return None
 
-def start_download(album_id: str):
-    global _task_counter
-    with _task_lock:
-        _task_counter += 1
-        task_id = str(_task_counter)
-
-    _download_tasks[task_id] = {
-        "album_id": album_id,
-        "start_time": datetime.now(),
-        "status": "下载中",
-    }
-
+def download_album_sync(album_id: str, progress_callback=None):
     temp_dir = tempfile.mkdtemp(prefix=f"jm_{album_id}_")
-    q = queue.Queue()
-    _progress_queues[task_id] = (q, temp_dir, album_id)
-    threading.Thread(
-        target=_run_download, args=(task_id, album_id, q, temp_dir), daemon=True
-    ).start()
-    return task_id
+    cap = ProgressCapture()
+    old_stdout = sys.stdout
+    sys.stdout = cap
 
-def check_download_status(task_id: str):
-    entry = _progress_queues.get(task_id)
-    if entry is None:
-        return {"error": "任务不存在"}
+    try:
+        option = _build_option(temp_dir)
+        option.download_album(album_id)
 
-    q, _td, _aid = entry
-    msgs = []
-    while True:
-        try:
-            msg = q.get_nowait()
-            msgs.append(msg)
-            if msg.get("type") in ("done", "error"):
-                break
-        except queue.Empty:
-            break
+        pdf_files = sorted(
+            [f for f in os.listdir(temp_dir) if f.endswith(".pdf")],
+            key=lambda x: int(re.sub(r"\D", "", x) or 0),
+        )
+        if not pdf_files:
+            raise RuntimeError("未生成 PDF 文件")
 
-    last = msgs[-1] if msgs else {}
-    if last.get("type") == "done":
-        return {"status": "done", "task_id": task_id, "file": last.get("file"), "files": last.get("files")}
-    if last.get("type") == "error":
-        return {"error": last.get("message")}
-
-    return {
-        "status": "downloading",
-        "text": last.get("text", ""),
-        "chapter_done": last.get("chapter_done", 0),
-        "chapter_total": last.get("chapter_total", 1),
-        "image_done": last.get("image_done", 0),
-        "image_total": last.get("image_total", 1),
-    }
-
-def get_download_file(task_id: str):
-    entry = _progress_queues.get(task_id)
-    if entry is None:
-        return None, None
-
-    _q, temp_dir, album_id = entry
-    pdf_files = sorted(
-        [f for f in os.listdir(temp_dir) if f.endswith(".pdf")],
-        key=lambda x: int(re.sub(r"\D", "", x) or 0),
-    )
-    if not pdf_files:
-        return None, None
-
-    if len(pdf_files) == 1:
-        final_pdf = os.path.join(temp_dir, pdf_files[0])
-        download_name = f"{album_id}.pdf"
-        mime = "application/pdf"
-    else:
-        import zipfile
-        zip_path = os.path.join(temp_dir, f"{album_id}.zip")
-        if not os.path.exists(zip_path):
+        if len(pdf_files) == 1:
+            final_path = os.path.join(temp_dir, f"{album_id}.pdf")
+            os.rename(os.path.join(temp_dir, pdf_files[0]), final_path)
+            with open(final_path, "rb") as f:
+                content = f.read()
+            filename = f"{album_id}.pdf"
+        else:
+            zip_path = os.path.join(temp_dir, f"{album_id}.zip")
             with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
                 for pf in pdf_files:
                     zf.write(os.path.join(temp_dir, pf), pf)
-        final_pdf = zip_path
-        download_name = f"{album_id}.zip"
-        mime = "application/zip"
+            with open(zip_path, "rb") as f:
+                content = f.read()
+            filename = f"{album_id}.zip"
 
-    with open(final_pdf, "rb") as f:
-        content = f.read()
+        return {"status": "done", "content": content, "filename": filename, "logs": cap.logs}
 
-    def _delayed_cleanup():
-        time.sleep(600)
-        _progress_queues.pop(task_id, None)
+    except Exception as e:
+        return {"status": "error", "message": str(e), "logs": cap.logs}
+    finally:
+        sys.stdout = old_stdout
         shutil.rmtree(temp_dir, ignore_errors=True)
-    threading.Thread(target=_delayed_cleanup, daemon=True).start()
-
-    return content, download_name
 
 st.title("📚 JM Downloader")
 
@@ -378,43 +273,25 @@ with tab1:
                     st.write(f"{i}. {ch['title']} ({ch['pages']}页)")
 
                 if st.button("开始下载 PDF", key="download_btn"):
-                    task_id = start_download(info["id"])
-                    st.session_state.task_id = task_id
-                    st.session_state.download_logs = []
-                    st.session_state.download_status = "downloading"
+                    with st.status("下载中...", expanded=True) as status:
+                        st.write(f"正在下载本子 {info['id']}...")
+                        result = download_album_sync(info["id"])
+                        
+                        if result["logs"]:
+                            for log in result["logs"]:
+                                st.write(log)
 
-    if "task_id" in st.session_state:
-        task_id = st.session_state.task_id
-        status = check_download_status(task_id)
-
-        if status.get("status") == "downloading":
-            progress = (status["chapter_done"] / status["chapter_total"]) * 100
-            st.progress(progress)
-            st.write(f"章节 {status['chapter_done']} / {status['chapter_total']}")
-            st.write(f"图片 {status['image_done']} / {status['image_total']}")
-            if status["text"]:
-                st.session_state.download_logs.append(status["text"])
-                for log in st.session_state.download_logs[-20:]:
-                    st.write(log)
-            st.rerun()
-
-        elif status.get("status") == "done":
-            st.success("✅ 下载完成！")
-            content, filename = get_download_file(task_id)
-            if content and filename:
-                st.download_button(
-                    label="下载文件",
-                    data=content,
-                    file_name=filename,
-                    mime="application/pdf" if filename.endswith(".pdf") else "application/zip"
-                )
-            st.session_state.pop("task_id")
-            st.session_state.pop("download_logs")
-
-        elif "error" in status:
-            st.error(f"❌ 下载失败: {status['error']}")
-            st.session_state.pop("task_id")
-            st.session_state.pop("download_logs")
+                        if result["status"] == "done":
+                            status.update(label="下载完成！", state="complete")
+                            st.download_button(
+                                label="下载文件",
+                                data=result["content"],
+                                file_name=result["filename"],
+                                mime="application/pdf" if result["filename"].endswith(".pdf") else "application/zip"
+                            )
+                        else:
+                            status.update(label="下载失败", state="error")
+                            st.error(f"❌ {result['message']}")
 
 with tab2:
     col1, col2 = st.columns([4, 1])
