@@ -184,12 +184,15 @@ tab1, tab2 = st.tabs(["本子下载", "搜索"])
 
 with tab1:
     col1, col2, col3 = st.columns([4, 2, 2])
+    
     with col1:
-        album_id = st.text_input("输入本子号", placeholder="如 422866", key="album_id")
+        album_id = st.text_input("输入本子号", placeholder="如 422866")
+    
     with col2:
         st.write("")
         st.write("")
         search_btn = st.button("查询")
+    
     with col3:
         st.write("")
         st.write("")
@@ -199,82 +202,81 @@ with tab1:
     if random_lily:
         result = random_album("百合")
         if "error" not in result:
-            st.session_state.album_id = result["id"]
+            st.session_state['temp_album_id'] = result["id"]
             album_id = result["id"]
             st.success(f"🎲 随机百合: [{result['id']}] {result['title']}")
+            st.session_state['temp_album_info'] = get_album_info(result["id"])
 
     if random_guro:
         result = random_album("猎奇")
         if "error" not in result:
-            st.session_state.album_id = result["id"]
+            st.session_state['temp_album_id'] = result["id"]
             album_id = result["id"]
             st.success(f"🎲 随机猎奇: [{result['id']}] {result['title']}")
+            st.session_state['temp_album_info'] = get_album_info(result["id"])
 
     if search_btn and album_id:
         info = get_album_info(album_id)
         if "error" in info:
             st.error(f"获取失败: {info['error']}")
         else:
-            st.session_state.album_info = info
+            st.session_state['temp_album_info'] = info
 
-    if "album_info" in st.session_state:
-        info = st.session_state.album_info
-        if "error" in info:
-            st.error(info["error"])
-        else:
-            col_left, col_right = st.columns([3, 7])
-            with col_left:
-                cover_data = get_cover_image(info["id"])
-                if cover_data:
-                    st.image(cover_data, use_column_width=True)
+    info = st.session_state.get('temp_album_info')
+    if info and "error" not in info:
+        col_left, col_right = st.columns([3, 7])
+        with col_left:
+            cover_data = get_cover_image(info["id"])
+            if cover_data:
+                st.image(cover_data, use_column_width=True)
+            else:
+                st.image("https://via.placeholder.com/160x220?text=No+Cover", use_column_width=True)
+
+        with col_right:
+            st.subheader(f"[{info['id']}] {info['title']}")
+            st.write(f"**作者:** {info['author']}")
+            st.write(f"**章节数:** {info['chapter_count']}")
+            st.write(f"**总页数:** {info['page_count']}")
+
+            if info["tags"]:
+                st.write("**标签:**")
+                tags_str = ", ".join(info["tags"])
+                st.write(f"{tags_str}")
+
+            st.write("**章节列表:**")
+            for i, ch in enumerate(info["chapters"], 1):
+                st.write(f"{i}. {ch['title']} ({ch['pages']}页)")
+
+            if st.button("开始下载 PDF"):
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                logs_area = st.empty()
+                
+                status_text.text(f"正在下载本子 {info['id']}...")
+                
+                result = download_album_sync(info["id"])
+                
+                if result["logs"]:
+                    logs_area.text("\n".join(result["logs"]))
+                
+                progress_bar.progress(100)
+                
+                if result["status"] == "done":
+                    status_text.text("✅ 下载完成！")
+                    st.download_button(
+                        label="下载文件",
+                        data=result["content"],
+                        file_name=result["filename"],
+                        mime="application/pdf" if result["filename"].endswith(".pdf") else "application/zip"
+                    )
                 else:
-                    st.image("https://via.placeholder.com/160x220?text=No+Cover", use_column_width=True)
-
-            with col_right:
-                st.subheader(f"[{info['id']}] {info['title']}")
-                st.write(f"**作者:** {info['author']}")
-                st.write(f"**章节数:** {info['chapter_count']}")
-                st.write(f"**总页数:** {info['page_count']}")
-
-                if info["tags"]:
-                    st.write("**标签:**")
-                    tags_str = ", ".join(info["tags"])
-                    st.write(f"{tags_str}")
-
-                st.write("**章节列表:**")
-                for i, ch in enumerate(info["chapters"], 1):
-                    st.write(f"{i}. {ch['title']} ({ch['pages']}页)")
-
-                if st.button("开始下载 PDF", key="download_btn"):
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
-                    logs_area = st.empty()
-                    
-                    status_text.text("正在下载本子 {}...".format(info["id"]))
-                    
-                    result = download_album_sync(info["id"])
-                    
-                    if result["logs"]:
-                        logs_area.text("\n".join(result["logs"]))
-                    
-                    progress_bar.progress(100)
-                    
-                    if result["status"] == "done":
-                        status_text.text("✅ 下载完成！")
-                        st.download_button(
-                            label="下载文件",
-                            data=result["content"],
-                            file_name=result["filename"],
-                            mime="application/pdf" if result["filename"].endswith(".pdf") else "application/zip"
-                        )
-                    else:
-                        status_text.text("❌ 下载失败")
-                        st.error(result["message"])
+                    status_text.text("❌ 下载失败")
+                    st.error(result["message"])
 
 with tab2:
     col1, col2 = st.columns([4, 1])
     with col1:
-        tag = st.text_input("输入标签", placeholder="如：百合、全彩、人妻", key="search_tag")
+        tag = st.text_input("输入标签", placeholder="如：百合、全彩、人妻")
     with col2:
         st.write("")
         st.write("")
@@ -285,16 +287,15 @@ with tab2:
         if "error" in result:
             st.error(f"搜索失败: {result['error']}")
         else:
-            st.session_state.search_result = result
+            st.session_state['search_result'] = result
 
-    if "search_result" in st.session_state:
-        result = st.session_state.search_result
-        if result["items"]:
-            for item in result["items"]:
+    search_result = st.session_state.get('search_result')
+    if search_result:
+        if search_result["items"]:
+            for item in search_result["items"]:
                 if st.button(f"[{item['id']}] {item['title']}", key=f"search_{item['id']}"):
                     info = get_album_info(item["id"])
                     if "error" not in info:
-                        st.session_state.album_info = info
-                        st.session_state.album_id = item["id"]
+                        st.session_state['temp_album_info'] = info
         else:
             st.write("无结果")
