@@ -197,6 +197,36 @@ def get_cover_image(album_id: str):
     except Exception:
         return None
 
+def get_top_album():
+    """获取全站排行榜第一的本子"""
+    today = datetime.now().strftime("%Y%m%d")
+    cache = st.session_state.get('daily_top')
+    if cache and cache.get('date') == today:
+        return cache
+
+    try:
+        opt = create_option_by_str("log: false\nclient: {impl: api, retry_times: 5}")
+        client = opt.build_jm_client()
+        # 用热门标签搜索获取排行榜第一页
+        tags = ["全彩", "百合", "人妻"]
+        items = []
+        for tag in tags:
+            try:
+                result = client.search_tag(f"+{tag}", page=1)
+                items = list(result.iter_id_title())
+                if items:
+                    break
+            except Exception:
+                continue
+        if not items:
+            return None
+        album_id, title = items[0]
+        rec = {"date": today, "id": album_id, "title": title}
+        st.session_state['daily_top'] = rec
+        return rec
+    except Exception:
+        return None
+
 def download_album_sync(album_id: str):
     temp_dir = tempfile.mkdtemp(prefix=f"jm_{album_id}_")
     old_stdout = sys.stdout
@@ -473,3 +503,24 @@ with tab3:
             _save_stats(_stats)
             st.success("统计已清除！")
             st.rerun()
+
+# ── 每日推荐 ──────────────────────────────────────────
+st.markdown("---")
+st.subheader("🌟 每日推荐")
+top = get_top_album()
+if top:
+    col_a, col_b = st.columns([1, 8])
+    with col_a:
+        cover = get_cover_image(top["id"])
+        if cover:
+            st.image(cover, width=120)
+    with col_b:
+        st.write(f"**本子号:** {top['id']}")
+        st.write(f"**标题:** {top['title']}")
+        if st.button("查看详情", key="daily_rec_btn"):
+            info = get_album_info(top["id"])
+            if "error" not in info:
+                st.session_state['temp_album_info'] = info
+                st.rerun()
+else:
+    st.info("获取每日推荐失败，请稍后再试")
