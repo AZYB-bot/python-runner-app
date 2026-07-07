@@ -6,7 +6,11 @@ import sys
 import tempfile
 import random
 import zipfile
+import json
+import time
 from io import StringIO
+from datetime import datetime
+from collections import deque
 
 try:
     import jmcomic
@@ -20,6 +24,62 @@ st.set_page_config(page_title="JM Downloader", layout="wide")
 
 if not JMCOMIC_AVAILABLE:
     st.stop()
+
+# ── 配置 ──────────────────────────────────────────────
+ADMIN_PASSWORD = "admin"
+STATS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".stats.json")
+
+# ── 持久化统计 ────────────────────────────────────────
+def _load_stats():
+    if os.path.exists(STATS_FILE):
+        try:
+            with open(STATS_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {
+        "total_requests": 0,
+        "total_downloads": 0,
+        "total_bytes": 0,
+        "start_time": datetime.now().isoformat(),
+        "download_logs": [],
+    }
+
+def _save_stats(stats):
+    try:
+        with open(STATS_FILE, "w") as f:
+            json.dump(stats, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+_stats = _load_stats()
+
+def _log_request():
+    _stats["total_requests"] += 1
+    _save_stats(_stats)
+
+def _log_download(album_id, filename, size, status, ip=""):
+    log_entry = {
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "album_id": album_id,
+        "filename": filename,
+        "size": size,
+        "status": status,
+        "ip": ip,
+    }
+    _stats["total_downloads"] += 1
+    _stats["total_bytes"] += size
+    _stats["download_logs"].insert(0, log_entry)
+    if len(_stats["download_logs"]) > 200:
+        _stats["download_logs"] = _stats["download_logs"][:200]
+    _save_stats(_stats)
+
+def fmt_bytes(b):
+    if b < 1024:
+        return f"{b} B"
+    if b < 1024 * 1024:
+        return f"{b / 1024:.1f} KB"
+    return f"{b / 1024 / 1024:.1f} MB"
 
 OPTION_BASE = {
     "download": {
@@ -152,6 +212,8 @@ def download_album_sync(album_id: str):
         if not pdf_files:
             raise RuntimeError("未生成 PDF 文件")
 
+        content = None
+        filename = ""
         if len(pdf_files) == 1:
             final_path = os.path.join(temp_dir, f"{album_id}.pdf")
             os.rename(os.path.join(temp_dir, pdf_files[0]), final_path)
@@ -167,10 +229,14 @@ def download_album_sync(album_id: str):
                 content = f.read()
             filename = f"{album_id}.zip"
 
+        size = len(content) if content else 0
+        _log_download(album_id, filename, size, "已完成")
+
         logs = log_buffer.getvalue().strip().split("\n") if log_buffer.getvalue() else []
         return {"status": "done", "content": content, "filename": filename, "logs": logs}
 
     except Exception as e:
+        _log_download(album_id, "", 0, "失败")
         logs = log_buffer.getvalue().strip().split("\n") if log_buffer.getvalue() else []
         return {"status": "error", "message": str(e), "logs": logs}
     finally:
@@ -178,9 +244,13 @@ def download_album_sync(album_id: str):
         sys.stderr = old_stderr
         shutil.rmtree(temp_dir, ignore_errors=True)
 
+# ── 记录请求 ──────────────────────────────────────────
+_log_request()
+
+# ── UI ────────────────────────────────────────────────
 st.title("📚 JM Downloader")
 
-tab1, tab2 = st.tabs(["本子下载", "搜索"])
+tab1, tab2, tab3 = st.tabs(["本子下载", "搜索", "管理面板"])
 
 with tab1:
     col1, col2, col3 = st.columns([4, 2, 2])
@@ -203,7 +273,6 @@ with tab1:
         result = random_album("百合")
         if "error" not in result:
             st.session_state['temp_album_id'] = result["id"]
-            album_id = result["id"]
             st.success(f"🎲 随机百合: [{result['id']}] {result['title']}")
             st.session_state['temp_album_info'] = get_album_info(result["id"])
 
@@ -211,7 +280,6 @@ with tab1:
         result = random_album("猎奇")
         if "error" not in result:
             st.session_state['temp_album_id'] = result["id"]
-            album_id = result["id"]
             st.success(f"🎲 随机猎奇: [{result['id']}] {result['title']}")
             st.session_state['temp_album_info'] = get_album_info(result["id"])
 
@@ -299,3 +367,88 @@ with tab2:
                         st.session_state['temp_album_info'] = info
         else:
             st.write("无结果")
+
+with tab3:
+    # 密码验证
+    admin_verified = st.session_state.get('admin_verified', False)
+    
+    if not admin_verified:
+        st.subheader("🔒 管理员登录")
+        pwd = st.text_input("请输入管理员密码", type="password")
+        if st.button("登录"):
+            if pwd == ADMIN_PASSWORD:
+                st.session_state['admin_verified'] = True
+                st.success("登录成功！")
+                st.rerun()
+            else:
+                st.error("密码错误")
+    else:
+        # 已登录 - 显示管理面板
+        st.subheader("📊 管理面板")
+        
+        if st.button("退出登录"):
+            st.session_state['admin_verified'] = False
+            st.rerun()
+        
+        # 流量概览
+        st.markdown("### 流量概览")
+        col1, col2, col3, col4 = st.columns(4)
+        start = datetime.fromisoformat(_stats["start_time"])
+        uptime = int((datetime.now() - start).total_seconds())
+        
+        with col1:
+            st.metric("总请求数", _stats["total_requests"])
+        with col2:
+            st.metric("总下载数", _stats["total_downloads"])
+        with col3:
+            st.metric("总流量", fmt_bytes(_stats["total_bytes"]))
+        with col4:
+            h = uptime // 3600
+            m = (uptime % 3600) // 60
+            st.metric("运行时间", f"{h}h{m}m")
+        
+        # 下载任务列表
+        st.markdown("### 📥 下载任务")
+        logs = _stats.get("download_logs", [])
+        if logs:
+            table_data = []
+            for log in logs[:50]:
+                table_data.append([
+                    log["time"],
+                    log["album_id"],
+                    log["filename"],
+                    fmt_bytes(log["size"]),
+                    log["status"],
+                ])
+            st.dataframe(
+                table_data,
+                column_config={
+                    "0": "时间",
+                    "1": "本子号",
+                    "2": "文件名",
+                    "3": "大小",
+                    "4": "状态",
+                },
+                use_container_width=True,
+                hide_index=True,
+                height=400,
+            )
+        else:
+            st.info("暂无下载记录")
+        
+        # 请求日志
+        st.markdown("### 🌐 请求日志")
+        st.write(f"自 {start.strftime('%Y-%m-%d %H:%M:%S')} 启动以来，共处理 {_stats['total_requests']} 次请求。")
+        
+        # 清除统计
+        if st.button("🗑️ 清除所有统计"):
+            _stats.update({
+                "total_requests": 0,
+                "total_downloads": 0,
+                "total_bytes": 0,
+                "start_time": datetime.now().isoformat(),
+                "download_logs": [],
+            })
+            _save_stats(_stats)
+            st.success("统计已清除！")
+            st.rerun()
