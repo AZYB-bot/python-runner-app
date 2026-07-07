@@ -30,38 +30,6 @@ OPTION_BASE = {
     "client": {"impl": "api", "retry_times": 3, "timeout": 15},
 }
 
-class ProgressCapture(StringIO):
-    def __init__(self):
-        super().__init__()
-        self.logs = []
-        self.chapter_done = 0
-        self.chapter_total = 0
-        self.image_done = 0
-        self.image_total = 0
-
-    def write(self, s):
-        super().write(s)
-        line = s.strip()
-        if not line:
-            return
-        self.logs.append(line)
-
-        m = re.search(r"章节数:\s*(\d+)", line)
-        if m:
-            self.chapter_total = int(m.group(1))
-
-        m = re.search(r"共\s*(\d+)\s*章节", line)
-        if m:
-            self.chapter_total = int(m.group(1))
-
-        m = re.search(r"\[(\d+)/(\d+)\]", line)
-        if m:
-            self.image_done = int(m.group(1))
-            self.image_total = int(m.group(2))
-
-        if "章节下载完成" in line:
-            self.chapter_done += 1
-
 def _build_option(temp_dir: str) -> JmOption:
     cfg = dict(OPTION_BASE)
     cfg["dir_rule"] = {"rule": "Bd_Aid", "base_dir": temp_dir}
@@ -165,11 +133,13 @@ def get_cover_image(album_id: str):
     except Exception:
         return None
 
-def download_album_sync(album_id: str, progress_callback=None):
+def download_album_sync(album_id: str):
     temp_dir = tempfile.mkdtemp(prefix=f"jm_{album_id}_")
-    cap = ProgressCapture()
     old_stdout = sys.stdout
-    sys.stdout = cap
+    old_stderr = sys.stderr
+    log_buffer = StringIO()
+    sys.stdout = log_buffer
+    sys.stderr = log_buffer
 
     try:
         option = _build_option(temp_dir)
@@ -197,12 +167,15 @@ def download_album_sync(album_id: str, progress_callback=None):
                 content = f.read()
             filename = f"{album_id}.zip"
 
-        return {"status": "done", "content": content, "filename": filename, "logs": cap.logs}
+        logs = log_buffer.getvalue().strip().split("\n") if log_buffer.getvalue() else []
+        return {"status": "done", "content": content, "filename": filename, "logs": logs}
 
     except Exception as e:
-        return {"status": "error", "message": str(e), "logs": cap.logs}
+        logs = log_buffer.getvalue().strip().split("\n") if log_buffer.getvalue() else []
+        return {"status": "error", "message": str(e), "logs": logs}
     finally:
         sys.stdout = old_stdout
+        sys.stderr = old_stderr
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 st.title("📚 JM Downloader")
@@ -273,25 +246,30 @@ with tab1:
                     st.write(f"{i}. {ch['title']} ({ch['pages']}页)")
 
                 if st.button("开始下载 PDF", key="download_btn"):
-                    with st.status("下载中...", expanded=True) as status:
-                        st.write(f"正在下载本子 {info['id']}...")
-                        result = download_album_sync(info["id"])
-                        
-                        if result["logs"]:
-                            for log in result["logs"]:
-                                st.write(log)
-
-                        if result["status"] == "done":
-                            status.update(label="下载完成！", state="complete")
-                            st.download_button(
-                                label="下载文件",
-                                data=result["content"],
-                                file_name=result["filename"],
-                                mime="application/pdf" if result["filename"].endswith(".pdf") else "application/zip"
-                            )
-                        else:
-                            status.update(label="下载失败", state="error")
-                            st.error(f"❌ {result['message']}")
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    logs_area = st.empty()
+                    
+                    status_text.text("正在下载本子 {}...".format(info["id"]))
+                    
+                    result = download_album_sync(info["id"])
+                    
+                    if result["logs"]:
+                        logs_area.text("\n".join(result["logs"]))
+                    
+                    progress_bar.progress(100)
+                    
+                    if result["status"] == "done":
+                        status_text.text("✅ 下载完成！")
+                        st.download_button(
+                            label="下载文件",
+                            data=result["content"],
+                            file_name=result["filename"],
+                            mime="application/pdf" if result["filename"].endswith(".pdf") else "application/zip"
+                        )
+                    else:
+                        status_text.text("❌ 下载失败")
+                        st.error(result["message"])
 
 with tab2:
     col1, col2 = st.columns([4, 1])
