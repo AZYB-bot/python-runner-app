@@ -26,7 +26,7 @@ if not JMCOMIC_AVAILABLE:
     st.stop()
 
 # ── 配置 ──────────────────────────────────────────────
-ADMIN_PASSWORD = "admin"
+ADMIN_PASSWORD = "dahan123"
 STATS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".stats.json")
 
 # ── 持久化统计 ────────────────────────────────────────
