@@ -1,0 +1,10 @@
+[theme]
+primaryColor="#4f8cff"
+backgroundColor="#0f0f0f"
+secondaryBackgroundColor="#1a1a1a"
+textColor="#e0e0e0"
+font="sans serif"
+
+[server]
+headless = true
+port = "$PORT"
