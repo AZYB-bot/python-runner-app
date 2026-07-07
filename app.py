@@ -56,6 +56,10 @@ _stats = _load_stats()
 
 def _log_request():
     _stats["total_requests"] += 1
+    entry = {"time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+    _stats.setdefault("request_logs", []).insert(0, entry)
+    if len(_stats["request_logs"]) > 200:
+        _stats["request_logs"] = _stats["request_logs"][:200]
     _save_stats(_stats)
 
 def _log_download(album_id, filename, size, status, ip=""):
@@ -440,6 +444,22 @@ with tab3:
         st.markdown("### 🌐 请求日志")
         st.write(f"自 {start.strftime('%Y-%m-%d %H:%M:%S')} 启动以来，共处理 {_stats['total_requests']} 次请求。")
         
+        req_logs = _stats.get("request_logs", [])
+        if req_logs:
+            req_data = [[i + 1, log["time"]] for i, log in enumerate(req_logs[:50])]
+            st.dataframe(
+                req_data,
+                column_config={
+                    "0": "#",
+                    "1": "访问时间",
+                },
+                use_container_width=True,
+                hide_index=True,
+                height=300,
+            )
+        else:
+            st.info("暂无请求记录")
+        
         # 清除统计
         if st.button("🗑️ 清除所有统计"):
             _stats.update({
@@ -448,6 +468,7 @@ with tab3:
                 "total_bytes": 0,
                 "start_time": datetime.now().isoformat(),
                 "download_logs": [],
+                "request_logs": [],
             })
             _save_stats(_stats)
             st.success("统计已清除！")
