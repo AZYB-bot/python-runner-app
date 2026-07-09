@@ -284,7 +284,7 @@ _log_request()
 # ── UI ────────────────────────────────────────────────
 st.title("📚 JM Downloader")
 
-tab1, tab2, tab3 = st.tabs(["本子下载", "搜索", "管理面板"])
+tab1, tab2, tab3, tab4 = st.tabs(["本子下载", "搜索", "管理面板", "批量下载"])
 
 with tab1:
     col1, col2, col3 = st.columns([4, 2, 2])
@@ -503,6 +503,74 @@ with tab3:
             _save_stats(_stats)
             st.success("统计已清除！")
             st.rerun()
+
+with tab4:
+    st.subheader("📦 批量下载")
+    st.write("输入多个本子号，每行一个或用逗号分隔")
+    
+    batch_input = st.text_area("输入本子号列表", placeholder="422866\n422867\n422868\n或: 422866, 422867, 422868", height=120)
+    
+    if st.button("开始批量下载", key="batch_dl"):
+        # 解析输入
+        ids = re.split(r'[\n,，\s]+', batch_input.strip())
+        ids = [i.strip() for i in ids if i.strip()]
+        
+        if not ids:
+            st.error("请输入至少一个本子号")
+        else:
+            st.info(f"共 {len(ids)} 个本子，开始批量下载...")
+            
+            all_files = []
+            failed = []
+            
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            for idx, aid in enumerate(ids):
+                status_text.text(f"[{idx + 1}/{len(ids)}] 正在下载 {aid}...")
+                
+                result = download_album_sync(aid)
+                
+                if result["status"] == "done":
+                    all_files.append({
+                        "id": aid,
+                        "filename": result["filename"],
+                        "content": result["content"],
+                    })
+                    st.write(f"✅ {aid} 下载完成")
+                else:
+                    failed.append(aid)
+                    st.write(f"❌ {aid} 下载失败: {result['message']}")
+                
+                progress_bar.progress((idx + 1) / len(ids))
+            
+            # 打包所有文件
+            if all_files:
+                zip_path = tempfile.mktemp(suffix=".zip")
+                with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for f in all_files:
+                        zf.writestr(f["filename"], f["content"])
+                
+                with open(zip_path, "rb") as f:
+                    zip_content = f.read()
+                os.remove(zip_path)
+                
+                status_text.text("✅ 批量下载完成！")
+                
+                summary = f"成功 {len(all_files)} 个"
+                if failed:
+                    summary += f"，失败 {len(failed)} 个: {', '.join(failed)}"
+                st.write(summary)
+                
+                st.download_button(
+                    label="📦 下载全部文件",
+                    data=zip_content,
+                    file_name=f"batch_{len(all_files)}albums.zip",
+                    mime="application/zip"
+                )
+            else:
+                status_text.text("❌ 全部下载失败")
+                st.error("没有成功下载任何本子")
 
 # ── 每日推荐 ──────────────────────────────────────────
 st.markdown("---")
