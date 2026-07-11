@@ -197,6 +197,47 @@ def get_cover_image(album_id: str):
     except Exception:
         return None
 
+def get_page_images(album_id: str, max_pages: int = 20):
+    """获取本子前几页图片用于预览"""
+    images = []
+    try:
+        opt = JmOption.construct({
+            "log": False,
+            "client": {"impl": "api", "retry_times": 5},
+            "download": {"cache": False, "image": {"suffix": ".jpg"}},
+        })
+        client = opt.build_jm_client()
+        album = client.get_album_detail(album_id)
+        if not album.episode_list:
+            return []
+
+        count = 0
+        for photo_id, _, _ in album.episode_list:
+            if count >= max_pages:
+                break
+            try:
+                photo = client.get_photo_detail(photo_id)
+                if not photo.page_arr:
+                    continue
+                for i in range(len(photo.page_arr)):
+                    if count >= max_pages:
+                        break
+                    img_detail = photo.create_image_detail(i)
+                    fd, path = tempfile.mkstemp(suffix=".jpg")
+                    os.close(fd)
+                    try:
+                        client.download_by_image_detail(img_detail, path)
+                        with open(path, "rb") as f:
+                            images.append(f.read())
+                    finally:
+                        os.remove(path)
+                    count += 1
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return images
+
 def get_top_album():
     """获取全站排行榜第一的本子"""
     today = datetime.now().strftime("%Y%m%d")
@@ -349,7 +390,13 @@ with tab1:
             for i, ch in enumerate(info["chapters"], 1):
                 st.write(f"{i}. {ch['title']} ({ch['pages']}页)")
 
-            if st.button("开始下载 PDF"):
+            col_btn1, col_btn2 = st.columns(2)
+            with col_btn1:
+                dl_clicked = st.button("开始下载 PDF")
+            with col_btn2:
+                preview_clicked = st.button("在线预览 (前20页)")
+
+            if dl_clicked:
                 progress_bar = st.progress(0)
                 status_text = st.empty()
                 logs_area = st.empty()
@@ -374,6 +421,35 @@ with tab1:
                 else:
                     status_text.text("❌ 下载失败")
                     st.error(result["message"])
+            
+            if preview_clicked:
+                with st.status("正在加载预览图...", expanded=True):
+                    images = get_page_images(info["id"], max_pages=20)
+                    if images:
+                        page_idx = st.session_state.get('preview_page', 0)
+                        total = len(images)
+                        
+                        st.image(images[page_idx], caption=f"第 {page_idx + 1} 页 / 共 {total} 页")
+                        
+                        c1, c2, c3, c4, c5 = st.columns([1, 1, 3, 1, 1])
+                        with c1:
+                            if st.button("⏮ 首页") and page_idx > 0:
+                                st.session_state['preview_page'] = 0
+                                st.rerun()
+                        with c2:
+                            if st.button("◀ 上一页") and page_idx > 0:
+                                st.session_state['preview_page'] = page_idx - 1
+                                st.rerun()
+                        with c4:
+                            if st.button("下一页 ▶") and page_idx < total - 1:
+                                st.session_state['preview_page'] = page_idx + 1
+                                st.rerun()
+                        with c5:
+                            if st.button("末页 ⏭") and page_idx < total - 1:
+                                st.session_state['preview_page'] = total - 1
+                                st.rerun()
+                    else:
+                        st.error("加载预览图失败")
 
 with tab2:
     col1, col2 = st.columns([4, 1])
