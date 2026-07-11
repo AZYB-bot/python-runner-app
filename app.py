@@ -426,28 +426,8 @@ with tab1:
                 with st.status("正在加载预览图...", expanded=True):
                     images = get_page_images(info["id"], max_pages=20)
                     if images:
-                        page_idx = st.session_state.get('preview_page', 0)
-                        total = len(images)
-                        
-                        st.image(images[page_idx], caption=f"第 {page_idx + 1} 页 / 共 {total} 页")
-                        
-                        c1, c2, c3, c4, c5 = st.columns([1, 1, 3, 1, 1])
-                        with c1:
-                            if st.button("⏮ 首页") and page_idx > 0:
-                                st.session_state['preview_page'] = 0
-                                st.rerun()
-                        with c2:
-                            if st.button("◀ 上一页") and page_idx > 0:
-                                st.session_state['preview_page'] = page_idx - 1
-                                st.rerun()
-                        with c4:
-                            if st.button("下一页 ▶") and page_idx < total - 1:
-                                st.session_state['preview_page'] = page_idx + 1
-                                st.rerun()
-                        with c5:
-                            if st.button("末页 ⏭") and page_idx < total - 1:
-                                st.session_state['preview_page'] = total - 1
-                                st.rerun()
+                        for idx, img in enumerate(images, 1):
+                            st.image(img, caption=f"第 {idx} 页")
                     else:
                         st.error("加载预览图失败")
 
