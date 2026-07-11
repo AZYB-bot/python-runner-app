@@ -89,7 +89,7 @@ OPTION_BASE = {
     "download": {
         "cache": True,
         "image": {"decode": True, "suffix": ".jpg"},
-        "threading": {"image": 50, "photo": 20},
+        "threading": {"image": 20, "photo": 10},
     },
     "client": {"impl": "api", "retry_times": 3, "timeout": 15},
 }
@@ -463,7 +463,7 @@ with tab3:
                     "3": "大小",
                     "4": "状态",
                 },
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
                 height=400,
             )
@@ -483,7 +483,7 @@ with tab3:
                     "0": "#",
                     "1": "访问时间",
                 },
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
                 height=300,
             )
