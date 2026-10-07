@@ -8,6 +8,7 @@ import zipfile
 import json
 import time
 import hmac
+import base64
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from io import StringIO
@@ -254,7 +255,7 @@ def _build_option(temp_dir: str) -> JmOption:
 # ── 数据获取层：统一加缓存，避免每次交互重复走网络 ────────────────────
 # 约定：缓存函数用「抛异常」表示失败，只有成功结果才进缓存 —— 否则一次
 #       网络抖动会被缓存住，用户接下来一小时都看到"失败"。
-MAX_CHAPTER_PROBE = 200     # 单次最多并发探测多少个章节的页数
+MAX_CHAPTER_PROBE = 300     # 懒加载每章页数时，单次最多探测多少章（安全上限）
 
 
 def _normalize_album_id(raw):
@@ -265,6 +266,14 @@ def _normalize_album_id(raw):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _album_info_cached(album_id: str) -> dict:
+    """只用 1 次请求返回专辑信息。
+
+    总页数直接取 album.page_count —— JM 详情接口自带该字段，比逐章求和
+    既快又准（实测某 144 章本子 API 给 6193 页，而逐章求和只有 6096 页，
+    因为并发探测时有个别章节返回了 0）。
+    各章页数/标题曾在这里逐章 get_photo_detail，实测要 290+ 次请求 / 30 秒
+    （改造前串行更是 318 秒）。现在改为按需加载，见 _chapter_detail_cached。
+    """
     opt = create_option_by_str(CLIENT_YAML_3)
     client = opt.build_jm_client()
     album = client.get_album_detail(album_id)
@@ -274,27 +283,18 @@ def _album_info_cached(album_id: str) -> dict:
     author = authors[0] if authors else (album.author or "")
     tags = [t for t in (album.tags or []) if t != "N/A"]
 
-    def probe(ep):
-        photo_id, _index, title = ep
-        try:
-            photo = client.get_photo_detail(photo_id)
-            pages = len(photo.page_arr) if photo.page_arr else 0
-            return {"id": photo_id, "title": photo.name or title or "", "pages": pages}
-        except Exception:
-            return {"id": photo_id, "title": title or "", "pages": 0}
-
-    head = episodes[:MAX_CHAPTER_PROBE]
-    if head:
-        # 原来是 for 循环串行请求：实测 144 章要 318 秒 / 290 次串行 HTTP。
-        # 各章节详情互不依赖，改用线程池并发（jmcomic 自身下载图片也是多线程的）。
-        with ThreadPoolExecutor(max_workers=min(12, len(head))) as ex:
-            chapters = list(ex.map(probe, head))
-    else:
-        chapters = []
-    chapters += [
-        {"id": pid, "title": t or "", "pages": 0}
-        for pid, _i, t in episodes[MAX_CHAPTER_PROBE:]
-    ]
+    chapters = []
+    for i, ep in enumerate(episodes, 1):
+        pid = ep[0]
+        index = ep[1] if len(ep) > 1 else None
+        title = (ep[2] if len(ep) > 2 else "") or ""
+        chapters.append({
+            "id": str(pid),
+            "index": str(index or i),
+            # JM 的 episode_list 只有部分本子带章节标题，其余要查详情才有；
+            # 这里先留空，渲染时回退成「第 N 章」。
+            "title": title.strip(),
+        })
 
     return {
         "id": album.album_id,
@@ -302,10 +302,37 @@ def _album_info_cached(album_id: str) -> dict:
         "author": author,
         "tags": tags,
         "chapter_count": len(episodes),
-        "page_count": sum(c["pages"] for c in chapters),
+        "page_count": int(album.page_count or 0),
         "chapters": chapters,
-        "partial": len(episodes) > MAX_CHAPTER_PROBE,
     }
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _chapter_detail_cached(album_id: str) -> dict:
+    """并发探测每一章的页数与真实标题。只在用户主动点「加载每章页数」时调用。
+
+    返回 {章节号(str): {"title":..., "pages":...}}
+    """
+    opt = create_option_by_str(CLIENT_YAML_3)
+    client = opt.build_jm_client()
+    album = client.get_album_detail(album_id)
+    episodes = list(album.episode_list or [])[:MAX_CHAPTER_PROBE]
+
+    def probe(ep):
+        pid = ep[0]
+        title = ((ep[2] if len(ep) > 2 else "") or "").strip()
+        try:
+            photo = client.get_photo_detail(pid)
+            pages = len(photo.page_arr) if photo.page_arr else 0
+            return str(pid), {"title": (photo.name or title or "").strip(), "pages": pages}
+        except Exception:
+            return str(pid), {"title": title, "pages": 0}
+
+    if not episodes:
+        return {}
+    # 各章节详情互不依赖，线程池并发（jmcomic 自身下载图片也是多线程的）
+    with ThreadPoolExecutor(max_workers=min(12, len(episodes))) as ex:
+        return dict(ex.map(probe, episodes))
 
 
 def get_album_info(album_id: str):
@@ -316,6 +343,16 @@ def get_album_info(album_id: str):
         return _album_info_cached(aid)
     except Exception as e:
         return {"error": str(e)}
+
+
+def get_chapter_detail(album_id: str) -> dict:
+    aid = _normalize_album_id(album_id)
+    if aid is None:
+        return {}
+    try:
+        return _chapter_detail_cached(aid)
+    except Exception:
+        return {}
 
 @st.cache_data(ttl=600, show_spinner=False)
 def _search_tag_cached(tag: str, page: int) -> list:
@@ -352,11 +389,15 @@ def _cover_cached(album_id: str) -> bytes:
         "download": {"cache": False, "image": {"suffix": ".jpg"}},
     })
     client = opt.build_jm_client()
-    album = client.get_album_detail(album_id)
-    if not album.episode_list:
+
+    # 复用专辑信息缓存来拿首章 ID，省掉一次 get_album_detail
+    # （本子详情页的流程里这份缓存本来就已经有了，等于 0 成本）
+    info = _album_info_cached(album_id)
+    chapters = info.get("chapters") or []
+    if not chapters:
         raise RuntimeError("该本子没有章节")
 
-    photo = client.get_photo_detail(album.episode_list[0][0])
+    photo = client.get_photo_detail(chapters[0]["id"])
     if not photo.page_arr:
         raise RuntimeError("首个章节没有图片")
 
@@ -387,6 +428,12 @@ def get_cover_image(album_id: str):
 
 @st.cache_data(ttl=1800, show_spinner=False, max_entries=4)
 def _page_images_cached(album_id: str, max_pages: int) -> list:
+    """并发下载预览图。
+
+    原实现是 for 循环里一张一张串行 download，实测 20 页要 35.3 秒。
+    这里先把要下的 image_detail 收集出来，再用线程池并发下载 —— 图片之间
+    完全独立，jmcomic 自己下载整本时也是多线程的。
+    """
     opt = JmOption.construct({
         "log": False,
         "client": {"impl": CLIENT_IMPL, "retry_times": 5},
@@ -397,33 +444,45 @@ def _page_images_cached(album_id: str, max_pages: int) -> list:
     if not album.episode_list:
         raise RuntimeError("该本子没有章节")
 
-    images = []
-    count = 0
+    # 第一步：收集目标图片（章节详情请求量很小）
+    targets = []
     for photo_id, _, _ in album.episode_list:
-        if count >= max_pages:
+        if len(targets) >= max_pages:
             break
         try:
             photo = client.get_photo_detail(photo_id)
             if not photo.page_arr:
                 continue
             for i in range(len(photo.page_arr)):
-                if count >= max_pages:
+                if len(targets) >= max_pages:
                     break
-                img_detail = photo.create_image_detail(i)
-                fd, path = tempfile.mkstemp(suffix=".jpg")
-                os.close(fd)
-                try:
-                    client.download_by_image_detail(img_detail, path)
-                    with open(path, "rb") as f:
-                        images.append(f.read())
-                finally:
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-                count += 1
+                targets.append(photo.create_image_detail(i))
         except Exception:
             continue
+
+    if not targets:
+        raise RuntimeError("未获取到任何预览图")
+
+    # 第二步：并发下载图片本体
+    def fetch(img_detail):
+        fd, path = tempfile.mkstemp(suffix=".jpg")
+        os.close(fd)
+        try:
+            client.download_by_image_detail(img_detail, path)
+            with open(path, "rb") as f:
+                return f.read()
+        except Exception:
+            return None
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    with ThreadPoolExecutor(max_workers=min(8, len(targets))) as ex:
+        results = list(ex.map(fetch, targets))
+
+    images = [r for r in results if r]
     if not images:
         raise RuntimeError("未获取到任何预览图")
     return images
@@ -608,13 +667,9 @@ with tab1:
     info = st.session_state.get('temp_album_info')
     if info and "error" not in info:
         col_left, col_right = st.columns([3, 7])
-        with col_left:
-            cover_data = get_cover_image(info["id"])
-            if cover_data:
-                st.image(cover_data)
-            else:
-                st.image("https://via.placeholder.com/160x220?text=No+Cover")
-
+        # 先渲染文字列，再渲染封面列。Streamlit 是按【代码顺序】执行的，
+        # 而封面要下载整张图(~6 秒)，如果把它写在前面，用户要盯着空白等 6 秒
+        # 才能看到本子信息。调换后文字约 1 秒就出来，封面随后补上。
         with col_right:
             st.subheader(f"[{info['id']}] {info['title']}")
             st.write(f"**作者:** {info['author']}")
@@ -626,9 +681,52 @@ with tab1:
                 tags_str = ", ".join(info["tags"])
                 st.write(f"{tags_str}")
 
+            # ── 章节列表：默认只显示标题(免费)，页数按需加载 ──────────
             st.write("**章节列表:**")
-            for i, ch in enumerate(info["chapters"], 1):
-                st.write(f"{i}. {ch['title']} ({ch['pages']}页)")
+            detail_map = st.session_state.get('chapter_detail') or {}
+            if detail_map.get("album_id") != info["id"]:
+                detail_map = {}
+
+            if info["chapters"]:
+                with st.container(height=260):
+                    for i, ch in enumerate(info["chapters"], 1):
+                        d = detail_map.get(ch["id"]) or {}
+                        title = d.get("title") or ch["title"] or f"第 {i} 章"
+                        pages = d.get("pages")
+                        suffix = f"（{pages} 页）" if pages is not None else ""
+                        st.write(f"{i}. {title}{suffix}")
+
+                if not detail_map:
+                    st.caption(
+                        f"总页数 {info['page_count']} 来自专辑接口，1 次请求即可得到。"
+                        f"各章页数需要逐章查询（{info['chapter_count']} 章），"
+                        f"点下面的按钮按需加载。"
+                    )
+                    if st.button("🔍 加载每章页数", key=f"chdetail_{info['id']}"):
+                        with st.spinner(f"正在并发获取 {info['chapter_count']} 章的页数..."):
+                            got = get_chapter_detail(info["id"])
+                        if got:
+                            st.session_state['chapter_detail'] = dict(
+                                got, album_id=info["id"])
+                            st.rerun()
+                        else:
+                            st.error("加载失败，请重试")
+                else:
+                    loaded = len(detail_map) - 1     # 减去 album_id
+                    pages_sum = sum(
+                        (d or {}).get("pages") or 0
+                        for k, d in detail_map.items() if k != "album_id"
+                    )
+                    st.caption(
+                        f"已加载 {loaded} 章的页数，逐章相加为 {pages_sum} 页。"
+                        f"上面的总页数 {info['page_count']} 取自专辑接口；"
+                        f"个别章节查询失败时，逐章相加会比真实值偏少。"
+                    )
+                    if st.button("🔄 重新加载每章页数", key=f"chreload_{info['id']}"):
+                        st.session_state['chapter_detail'] = {}
+                        st.rerun()
+            else:
+                st.caption("该本子没有章节。")
 
             col_btn1, col_btn2 = st.columns(2)
             with col_btn1:
@@ -672,6 +770,22 @@ with tab1:
                             st.image(img, caption=f"第 {idx} 页")
                     else:
                         st.error("加载预览图失败")
+
+        # 封面放到最后渲染：它要下载整张图，不应该挡住上面的文字信息。
+        # 用固定高度的容器把长条首图裁成正常缩略图（禁漫很多本子首页是
+        # 长条 webtoon 跨页图，直接 st.image(width=120) 会拉成几百像素高）。
+        with col_left:
+            cover_data = get_cover_image(info["id"])
+            if cover_data:
+                st.markdown(
+                    '<img src="data:image/jpeg;base64,{}" '
+                    'style="width:100%;max-width:200px;height:260px;object-fit:cover;'
+                    'border-radius:8px;display:block">'.format(
+                        base64.b64encode(cover_data).decode()),
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.caption("封面加载失败")
 
 with tab2:
     col1, col2 = st.columns([4, 1])
@@ -901,10 +1015,7 @@ st.subheader("🌟 每日推荐")
 top = get_top_album()
 if top:
     col_a, col_b = st.columns([1, 8])
-    with col_a:
-        cover = get_cover_image(top["id"])
-        if cover:
-            st.image(cover, width=120)
+    # 同样先出文字、后出封面，别让封面下载挡住这一屏
     with col_b:
         st.write(f"**本子号:** {top['id']}")
         st.write(f"**标题:** {top['title']}")
@@ -913,5 +1024,15 @@ if top:
             if "error" not in info:
                 st.session_state['temp_album_info'] = info
                 st.rerun()
+    with col_a:
+        cover = get_cover_image(top["id"])
+        if cover:
+            st.markdown(
+                '<img src="data:image/jpeg;base64,{}" '
+                'style="width:120px;height:160px;object-fit:cover;'
+                'border-radius:8px;display:block">'.format(
+                    base64.b64encode(cover).decode()),
+                unsafe_allow_html=True,
+            )
 else:
     st.info("获取每日推荐失败，请稍后再试")
