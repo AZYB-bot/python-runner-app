@@ -18,11 +18,72 @@ try:
     JMCOMIC_AVAILABLE = True
 except ImportError:
     JMCOMIC_AVAILABLE = False
-    st.error("⚠️ jmcomic 库未安装")
 
+# set_page_config 必须是第一个 Streamlit 调用，所以放在 st.error 之前
 st.set_page_config(page_title="JM Downloader", layout="wide")
 
+
+# ── 兼容补丁：JM API 响应体开头多了 UTF-8 BOM ──────────────────────────
+# 现象：禁漫的 API 域名(www.cdnhjk.net / www.cdngwc.cc / www.cdngwc.net …)
+#       现在会在所有响应体最前面加 EF BB BF(即 \ufeff)。
+#       jmcomic 的 api 客户端校验“第一个有效字符必须是 {”，只忽略
+#       空格/换行/制表符，遇到 BOM 就判为“不是json格式”并无限重试，
+#       最终抛 RequestRetryAllFailException，导致本应用所有功能全部失效。
+# 做法：放宽该字符校验(忽略 BOM/零宽字符)，从而继续使用 api 客户端。
+#       若补丁不适用(例如 jmcomic 内部结构调整)，自动退回 html 客户端。
+def _install_bom_tolerance_patch() -> bool:
+    try:
+        import jmcomic.jm_client_impl as _impl
+        from jmcomic import JmResp, JmcomicText, ExceptionTool
+        from jmcomic.jm_config import JmModuleConfig
+
+        cls = _impl.JmApiClient
+        if getattr(cls, "_dsh_bom_patched", False):
+            return True
+
+        _abstract_orig = _impl.AbstractJmClient.raise_if_resp_should_retry
+        _IGNORED = (" ", "\n", "\t", "\ufeff", "\u200b", "\u00a0")
+
+        def _raise_if_resp_should_retry(self, resp, is_image):
+            resp = _abstract_orig(self, resp, is_image)
+            if isinstance(resp, JmResp):
+                return resp
+
+            code = resp.status_code
+            if code >= 500:
+                msg = JmModuleConfig.JM_ERROR_STATUS_CODE.get(code, f"HTTP状态码: {code}")
+                ExceptionTool.raises_resp(f"禁漫API异常响应, {msg}", resp)
+
+            url = resp.request.url
+            if self.API_SCRAMBLE in url:
+                return resp
+
+            text = resp.text
+            for char in text:
+                if char not in _IGNORED:
+                    ExceptionTool.require_true(
+                        char == "{",
+                        f"请求不是json格式，强制重试！响应文本: [{JmcomicText.limit_text(text, 200)}]",
+                    )
+                    return resp
+            ExceptionTool.raises_resp(f"响应无数据！request_url=[{url}]", resp)
+
+        cls.raise_if_resp_should_retry = _raise_if_resp_should_retry
+        cls._dsh_bom_patched = True
+        return True
+    except Exception:
+        return False
+
+
+BOM_PATCHED = JMCOMIC_AVAILABLE and _install_bom_tolerance_patch()
+CLIENT_IMPL = "api" if BOM_PATCHED else "html"
+
+# 复用的客户端配置片段
+CLIENT_YAML_3 = f"log: false\nclient: {{impl: {CLIENT_IMPL}, retry_times: 3}}"
+CLIENT_YAML_5 = f"log: false\nclient: {{impl: {CLIENT_IMPL}, retry_times: 5}}"
+
 if not JMCOMIC_AVAILABLE:
+    st.error("⚠️ jmcomic 库未安装")
     st.stop()
 
 # ── 配置 ──────────────────────────────────────────────
@@ -91,7 +152,7 @@ OPTION_BASE = {
         "image": {"decode": True, "suffix": ".jpg"},
         "threading": {"image": 20, "photo": 10},
     },
-    "client": {"impl": "api", "retry_times": 3, "timeout": 15},
+    "client": {"impl": CLIENT_IMPL, "retry_times": 3, "timeout": 15},
 }
 
 def _build_option(temp_dir: str) -> JmOption:
@@ -112,7 +173,7 @@ def _build_option(temp_dir: str) -> JmOption:
 
 def get_album_info(album_id: str):
     try:
-        opt = create_option_by_str("log: false\nclient: {impl: api, retry_times: 3}")
+        opt = create_option_by_str(CLIENT_YAML_3)
         client = opt.build_jm_client()
         album = client.get_album_detail(album_id)
         episodes = album.episode_list
@@ -147,7 +208,7 @@ def get_album_info(album_id: str):
 
 def search_tag(tag: str, page: int = 1):
     try:
-        opt = create_option_by_str("log: false\nclient: {impl: api, retry_times: 3}")
+        opt = create_option_by_str(CLIENT_YAML_3)
         client = opt.build_jm_client()
         result = client.search_tag(tag, page=page)
         items = [{"id": aid, "title": title} for aid, title in result.iter_id_title()]
@@ -157,7 +218,7 @@ def search_tag(tag: str, page: int = 1):
 
 def random_album(tag: str = "百合"):
     try:
-        opt = create_option_by_str("log: false\nclient: {impl: api, retry_times: 3}")
+        opt = create_option_by_str(CLIENT_YAML_3)
         client = opt.build_jm_client()
         page = random.randint(1, 30)
         items = list(client.search_tag(f"+{tag}", page=page).iter_id_title())
@@ -172,7 +233,7 @@ def get_cover_image(album_id: str):
     try:
         opt = JmOption.construct({
             "log": False,
-            "client": {"impl": "api", "retry_times": 5},
+            "client": {"impl": CLIENT_IMPL, "retry_times": 5},
             "download": {"cache": False, "image": {"suffix": ".jpg"}},
         })
         client = opt.build_jm_client()
@@ -203,7 +264,7 @@ def get_page_images(album_id: str, max_pages: int = 20):
     try:
         opt = JmOption.construct({
             "log": False,
-            "client": {"impl": "api", "retry_times": 5},
+            "client": {"impl": CLIENT_IMPL, "retry_times": 5},
             "download": {"cache": False, "image": {"suffix": ".jpg"}},
         })
         client = opt.build_jm_client()
@@ -246,7 +307,7 @@ def get_top_album():
         return cache
 
     try:
-        opt = create_option_by_str("log: false\nclient: {impl: api, retry_times: 5}")
+        opt = create_option_by_str(CLIENT_YAML_5)
         client = opt.build_jm_client()
         # 用热门标签搜索获取排行榜第一页
         tags = ["全彩", "百合", "人妻"]
